@@ -162,9 +162,9 @@ func (o *readClient) currentValues() ([]telegraf.Metric, error) {
 	metrics := make([]telegraf.Metric, 0, len(o.NodeMetricMapping))
 	// Parse the resulting data into metrics
 	for i := range o.NodeIDs {
-		if !o.StatusCodeOK(o.LastReceivedData[i].Quality) {
-			continue
-		}
+		// if !o.StatusCodeOK(o.LastReceivedData[i].Quality) {
+		// 	continue
+		// }
 
 		metrics = append(metrics, o.MetricForNode(i))
 	}
