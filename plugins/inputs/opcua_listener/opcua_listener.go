@@ -45,7 +45,18 @@ func (o *OpcUaListener) Start(acc telegraf.Accumulator) error {
 }
 
 func (o *OpcUaListener) Gather(acc telegraf.Accumulator) error {
-	if o.client.State() == opcua.Connected || o.subscribeClientConfig.ConnectFailBehavior == "ignore" {
+	// If the subscription channel closed unexpectedly (e.g. OPC-UA server timeout),
+	// reconnect regardless of what State() reports — State() can remain "Connected"
+	// even after the server terminates the session, causing silent data loss.
+	if o.client != nil && o.client.SubDropped() {
+		o.Log.Warn("OPC UA subscription channel was closed by server; reconnecting")
+		o.client.ClearSubDropped()
+		return o.connect(acc)
+	}
+	if o.client == nil || o.client.State() == opcua.Connected || o.subscribeClientConfig.ConnectFailBehavior == "ignore" {
+		if o.client != nil {
+			o.client.RetryMissingItems(context.Background())
+		}
 		return nil
 	}
 	return o.connect(acc)
@@ -102,6 +113,7 @@ func init() {
 					Timestamp:  input.TimestampSourceTelegraf,
 				},
 				SubscriptionInterval: config.Duration(100 * time.Millisecond),
+				MaxRetryChunkSize:    500,
 			},
 		}
 	})

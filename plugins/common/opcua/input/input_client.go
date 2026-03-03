@@ -331,6 +331,7 @@ type OpcUAInputClient struct {
 	NodeMetricMapping      []NodeMetricMapping
 	NodeIDs                []*ua.NodeID
 	LastReceivedData       []NodeValue
+	BadNodeCount           int	
 	EventGroups            []EventGroupSettings
 	EventNodeMetricMapping []EventNodeMetricMapping
 }
@@ -549,14 +550,25 @@ func (o *OpcUAInputClient) InitEventNodeIDs() error {
 
 func (o *OpcUAInputClient) initLastReceivedValues() {
 	o.LastReceivedData = make([]NodeValue, len(o.NodeMetricMapping))
+	o.BadNodeCount = 0
 	for nodeIdx, nmm := range o.NodeMetricMapping {
 		o.LastReceivedData[nodeIdx].TagName = nmm.Tag.FieldName
+		o.LastReceivedData[nodeIdx].Quality = ua.StatusOK // initialize to OK
 	}
 }
 
 func (o *OpcUAInputClient) UpdateNodeValue(nodeIdx int, d *ua.DataValue) {
+	wasBad := !o.StatusCodeOK(o.LastReceivedData[nodeIdx].Quality)
 	o.LastReceivedData[nodeIdx].Quality = d.Status
-	if !o.StatusCodeOK(d.Status) {
+	isBad := !o.StatusCodeOK(d.Status)
+
+	if isBad && !wasBad {
+		o.BadNodeCount++
+	} else if !isBad && wasBad {
+		o.BadNodeCount--
+	}
+
+	if isBad {
 		// Verify NodeIDs array has been built before trying to get item; otherwise show '?' for node id
 		if len(o.NodeIDs) > nodeIdx {
 			o.Log.Errorf("status not OK for node %v (%v): %v", o.NodeMetricMapping[nodeIdx].Tag.FieldName, o.NodeIDs[nodeIdx].String(), d.Status)
