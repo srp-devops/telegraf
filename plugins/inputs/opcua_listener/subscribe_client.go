@@ -387,12 +387,33 @@ func (o *subscribeClient) processReceivedNotifications(ctx context.Context, data
 					}
 				}
 
-				// If ALL configured nodes went bad, the server might have invalidated the MonitoredItems.
-				// We need to trigger a full reconnect to restore them.
-				if o.SubDropped() || (len(o.NodeIDs) > 0 && o.BadNodeCount >= len(o.NodeIDs)) {
-					o.Log.Warnf("Triggering a reconnect to restore subscriptions.")
-					atomic.StoreInt32(&o.subDropped, 1)
-					return // stop processing so Gather() handles the reconnect
+				if o.SubDropped() {
+					o.Log.Warnf("Subscription was dropped. Reconnecting.")
+					return
+				}
+
+				// If ALL configured nodes went bad, check if they are fatal errors (e.g. namespace changed).
+				// We need to trigger a full reconnect to restore them quickly.
+				if len(o.NodeIDs) > 0 && o.BadNodeCount >= len(o.NodeIDs) {
+					fatalCount := 0
+					for _, d := range o.LastReceivedData {
+						errCode := d.Quality.Error()
+						if strings.Contains(errCode, "BadNodeIdUnknown") || 
+							strings.Contains(errCode, "BadNodeIdInvalid") || 
+							strings.Contains(errCode, "BadNotReadable") || 
+							strings.Contains(errCode, "BadUserAccessDenied") || 
+							strings.Contains(errCode, "BadTypeMismatch") {
+							fatalCount++
+						}
+					}
+
+					// If all nodes are fatal, a full tearing down is much faster than background chunking.
+					// If they are transient (e.g., BadNoCommunication), we do nothing and let the OPC session ride it out.
+					if fatalCount >= len(o.NodeIDs) {
+						o.Log.Warnf("All %d nodes returned fatal errors. Triggering a fast full reconnect to restore subscriptions.", fatalCount)
+						atomic.StoreInt32(&o.subDropped, 1)
+						return // stop processing so Gather() handles the reconnect
+					}
 				}
 			case *ua.EventNotificationList:
 				o.Log.Debugf("Processing event notification with %d events", len(notif.Events))

@@ -337,6 +337,8 @@ func (o *OpcUAClient) Connect(ctx context.Context) error {
 		ctx, cancel := context.WithTimeout(context.Background(), time.Duration(o.Config.ConnectTimeout))
 		defer cancel()
 		if err := o.Client.Connect(ctx); err != nil {
+			_ = o.Client.Close(ctx) // Attempt to gracefully close any partial connection
+			o.Client = nil          // Clean up state if connection fails
 			return &EndpointError{
 				Endpoint: o.Config.Endpoint,
 				Err:      fmt.Errorf("%w: %w", ErrConnectionFailed, err),

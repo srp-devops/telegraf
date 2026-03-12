@@ -18,6 +18,9 @@ type OpcUaListener struct {
 	subscribeClientConfig
 	client *subscribeClient
 	Log    telegraf.Logger `toml:"-"`
+
+	goroutineCtx    context.Context
+	goroutineCancel context.CancelFunc
 }
 
 //go:embed sample.conf
@@ -63,6 +66,10 @@ func (o *OpcUaListener) Gather(acc telegraf.Accumulator) error {
 }
 
 func (o *OpcUaListener) Stop() {
+	if o.goroutineCancel != nil {
+		o.goroutineCancel()
+	}
+
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	select {
 	case <-o.client.stop(ctx):
@@ -74,22 +81,34 @@ func (o *OpcUaListener) Stop() {
 }
 
 func (o *OpcUaListener) connect(acc telegraf.Accumulator) error {
+	// Cleanly stop any existing metric collection goroutine before starting a new one
+	if o.goroutineCancel != nil {
+		o.goroutineCancel()
+	}
+
 	ctx := context.Background()
 	ch, err := o.client.startMonitoring(ctx)
 	if err != nil {
 		return err
 	}
 
-	go func() {
+	o.goroutineCtx, o.goroutineCancel = context.WithCancel(context.Background())
+
+	go func(ctx context.Context) {
 		for {
-			m, ok := <-ch
-			if !ok {
-				o.Log.Debug("Metric collection stopped due to closed channel")
+			select {
+			case <-ctx.Done():
+				o.Log.Debug("Metric collection stopped due to context cancellation on reconnect")
 				return
+			case m, ok := <-ch:
+				if !ok {
+					o.Log.Debug("Metric collection stopped due to closed channel")
+					return
+				}
+				acc.AddMetric(m)
 			}
-			acc.AddMetric(m)
 		}
-	}()
+	}(o.goroutineCtx)
 
 	return nil
 }
