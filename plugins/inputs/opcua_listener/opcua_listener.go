@@ -21,6 +21,9 @@ type OpcUaListener struct {
 
 	goroutineCtx    context.Context
 	goroutineCancel context.CancelFunc
+
+	nextReconnectTime time.Time
+	reconnectWait     time.Duration
 }
 
 //go:embed sample.conf
@@ -54,7 +57,7 @@ func (o *OpcUaListener) Gather(acc telegraf.Accumulator) error {
 	if o.client != nil && o.client.SubDropped() {
 		o.Log.Warn("OPC UA subscription channel was closed by server; reconnecting")
 		o.client.ClearSubDropped()
-		return o.connect(acc)
+		return o.connectWithBackoff(acc)
 	}
 	if o.client == nil || o.client.State() == opcua.Connected || o.subscribeClientConfig.ConnectFailBehavior == "ignore" {
 		if o.client != nil {
@@ -62,7 +65,37 @@ func (o *OpcUaListener) Gather(acc telegraf.Accumulator) error {
 		}
 		return nil
 	}
-	return o.connect(acc)
+	return o.connectWithBackoff(acc)
+}
+
+func (o *OpcUaListener) connectWithBackoff(acc telegraf.Accumulator) error {
+	if time.Now().Before(o.nextReconnectTime) {
+		o.Log.Debugf("Waiting for reconnect backoff timer (%v remaining)", time.Until(o.nextReconnectTime).Round(time.Second))
+		return nil
+	}
+
+	err := o.connect(acc)
+	if err != nil {
+		if o.reconnectWait == 0 {
+			o.reconnectWait = 30 * time.Second
+		} else {
+			o.reconnectWait *= 2
+		}
+		if o.reconnectWait > 5*time.Minute {
+			o.reconnectWait = 5 * time.Minute
+		}
+		o.nextReconnectTime = time.Now().Add(o.reconnectWait)
+		o.Log.Errorf("Reconnect failed: %v. Backing off for %v", err, o.reconnectWait)
+		
+		if o.subscribeClientConfig.ConnectFailBehavior == "error" {
+			return err
+		}
+		return nil
+	}
+
+	o.reconnectWait = 0
+	o.nextReconnectTime = time.Time{}
+	return nil
 }
 
 func (o *OpcUaListener) Stop() {
