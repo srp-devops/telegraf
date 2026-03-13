@@ -39,7 +39,7 @@ jobs:
           platforms: linux/amd64,linux/arm64
           # By default, this will just build the images to verify they compile.
           # To push them to a registry, set push: true
-          push: false
+          push: true
           tags: telegraf-custom:latest
           # Optional: cache layers in GitHub Actions to speed up subsequent builds
           cache-from: type=gha
