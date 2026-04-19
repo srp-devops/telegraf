@@ -19,9 +19,10 @@ import (
 
 type subscribeClientConfig struct {
 	input.InputClientConfig
-	SubscriptionInterval config.Duration `toml:"subscription_interval"`
-	ConnectFailBehavior  string          `toml:"connect_fail_behavior"`
-	MaxRetryChunkSize    int             `toml:"max_retry_chunk_size"`
+	SubscriptionInterval      config.Duration `toml:"subscription_interval"`
+	ConnectFailBehavior       string          `toml:"connect_fail_behavior"`
+	MaxRetryChunkSize         int             `toml:"max_retry_chunk_size"`
+	StaleDataReconnectTimeout config.Duration `toml:"stale_data_reconnect_timeout"`
 }
 
 type subscribeClient struct {
@@ -41,6 +42,11 @@ type subscribeClient struct {
 	// by the gopcua library. Gather() polls this to trigger a Telegraf-level reconnect.
 	subDropped int32
 
+	// lastDataReceived stores the Unix timestamp of the most recent data or event
+	// notification. Used by the staleness watchdog in Gather() to detect zombie
+	// connections where gopcua reports Connected but no data is flowing.
+	lastDataReceived int64
+
 	failedItemsReqs      []*ua.MonitoredItemCreateRequest
 	failedEventItemsReqs []*ua.MonitoredItemCreateRequest
 }
@@ -51,6 +57,21 @@ func (o *subscribeClient) SubDropped() bool {
 
 func (o *subscribeClient) ClearSubDropped() {
 	atomic.StoreInt32(&o.subDropped, 0)
+}
+
+// UpdateLastDataReceived records that a data/event notification was just received.
+func (o *subscribeClient) UpdateLastDataReceived() {
+	atomic.StoreInt64(&o.lastDataReceived, time.Now().Unix())
+}
+
+// SecondsSinceLastData returns the number of seconds since the last data notification.
+// Returns 0 if no data has ever been received (watchdog should not fire).
+func (o *subscribeClient) SecondsSinceLastData() int64 {
+	last := atomic.LoadInt64(&o.lastDataReceived)
+	if last == 0 {
+		return 0
+	}
+	return time.Now().Unix() - last
 }
 
 // RetryMissingItems attempts to re-register monitored items that previously failed.
@@ -274,13 +295,21 @@ func (o *subscribeClient) stop(ctx context.Context) <-chan struct{} {
 }
 
 func (o *subscribeClient) startMonitoring(ctx context.Context) (<-chan telegraf.Metric, error) {
+	o.Log.Debugf("startMonitoring: beginning (re)connection sequence, current state=%v, subDropped=%v", o.State(), o.SubDropped())
+
 	// Cancel the previous processReceivedNotifications goroutine (if any) before
 	// creating fresh channels and a new connection. This prevents two goroutines
 	// from writing to the same metrics channel simultaneously.
 	if o.cancel != nil {
+		o.Log.Debugf("startMonitoring: cancelling previous notification goroutine")
 		o.cancel()
 	}
 	o.ctx, o.cancel = context.WithCancel(context.Background())
+
+	// Reset staleness timer — it only starts counting after the first notification
+	// arrives on the new connection, so the watchdog won't fire during initial setup.
+	atomic.StoreInt64(&o.lastDataReceived, 0)
+	o.Log.Debugf("startMonitoring: staleness timer reset to 0")
 
 	// Recreate channels on every (re)connect. gopcua closes the dataNotifications
 	// channel when the subscription is torn down, so reusing a closed channel would
@@ -338,39 +367,43 @@ func (o *subscribeClient) startMonitoring(ctx context.Context) (<-chan telegraf.
 		}
 	}
 
+	o.Log.Debugf("startMonitoring: launching processReceivedNotifications goroutine (monitoredItems=%d, failedItems=%d, eventItems=%d, failedEventItems=%d)",
+		len(o.monitoredItemsReqs), len(o.failedItemsReqs), len(o.eventItemsReqs), len(o.failedEventItemsReqs))
 	go o.processReceivedNotifications()
 
 	return o.metrics, nil
 }
 
 func (o *subscribeClient) processReceivedNotifications() {
+	o.Log.Debugf("processReceivedNotifications: goroutine started, waiting for notifications on dataNotifications channel")
 	for {
 		select {
 		case <-o.ctx.Done():
-			o.Log.Debug("Processing received notifications stopped")
+			o.Log.Debugf("processReceivedNotifications: context cancelled, stopping (state=%v, subDropped=%v)", o.State(), o.SubDropped())
 			return
 
 		case res, ok := <-o.dataNotifications:
 			if !ok {
 				// gopcua closed the channel — the session is unrecoverable at this level.
 				// Signal Gather() to perform a full Telegraf-level reconnect.
-				o.Log.Debugf("Data notification channel closed; marking subscription as dropped")
+				o.Log.Debugf("processReceivedNotifications: dataNotifications channel closed (state=%v); marking subscription as dropped", o.State())
 				atomic.StoreInt32(&o.subDropped, 1)
 				return
 			}
 			if res.Error != nil {
-				o.Log.Error(res.Error)
+				o.Log.Errorf("processReceivedNotifications: received error notification: %v (state=%v)", res.Error, o.State())
 				continue
 			}
 			if res.Value == nil {
 				// gopcua sends nil-value notifications as internal bookkeeping during
 				// session reconnects. Safe to skip — the session is still live.
-				o.Log.Warn("Received nil notification value, skipping")
+				o.Log.Warnf("processReceivedNotifications: received nil notification value (state=%v), skipping", o.State())
 				continue
 			}
 
 			switch notif := res.Value.(type) {
 			case *ua.DataChangeNotification:
+				o.UpdateLastDataReceived()
 				o.Log.Debugf("Received data change notification with %d items", len(notif.MonitoredItems))
 				for _, monitoredItemNotif := range notif.MonitoredItems {
 					i := int(monitoredItemNotif.ClientHandle)
@@ -420,6 +453,7 @@ func (o *subscribeClient) processReceivedNotifications() {
 				}
 
 			case *ua.EventNotificationList:
+				o.UpdateLastDataReceived()
 				o.Log.Debugf("Processing event notification with %d events", len(notif.Events))
 				for _, event := range notif.Events {
 					i := int(event.ClientHandle)
