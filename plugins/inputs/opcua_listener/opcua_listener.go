@@ -47,7 +47,7 @@ func (o *OpcUaListener) Init() (err error) {
 }
 
 func (o *OpcUaListener) Start(acc telegraf.Accumulator) error {
-	return o.connect(acc)
+	return o.connectWithBackoff(acc)
 }
 
 func (o *OpcUaListener) Gather(acc telegraf.Accumulator) error {
@@ -59,7 +59,7 @@ func (o *OpcUaListener) Gather(acc telegraf.Accumulator) error {
 		o.client.ClearSubDropped()
 		return o.connectWithBackoff(acc)
 	}
-	if o.client == nil || o.client.State() == opcua.Connected || o.subscribeClientConfig.ConnectFailBehavior == "ignore" {
+	if o.client == nil || o.client.State() == opcua.Connected || o.client.State() == opcua.Reconnecting || o.subscribeClientConfig.ConnectFailBehavior == "ignore" {
 		if o.client != nil {
 			o.client.RetryMissingItems(context.Background())
 		}
@@ -86,7 +86,7 @@ func (o *OpcUaListener) connectWithBackoff(acc telegraf.Accumulator) error {
 		}
 		o.nextReconnectTime = time.Now().Add(o.reconnectWait)
 		o.Log.Errorf("Reconnect failed: %v. Backing off for %v", err, o.reconnectWait)
-		
+
 		if o.subscribeClientConfig.ConnectFailBehavior == "error" {
 			return err
 		}
