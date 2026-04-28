@@ -278,20 +278,24 @@ func (o *subscribeClient) connect() error {
 
 func (o *subscribeClient) stop(ctx context.Context) <-chan struct{} {
 	o.Log.Debugf("Stopping OPC subscription...")
-	if o.State() != opcuaclient.Connected {
+	if o.State() != opcuaclient.Connected && o.State() != opcuaclient.Reconnecting {
 		return nil
 	}
 	if o.sub != nil {
 		if err := o.sub.Cancel(ctx); err != nil {
 			o.Log.Warn("Cancelling OPC UA subscription failed with error ", err)
 		}
+		o.sub = nil
 	}
-	closing := o.OpcUAInputClient.Stop(ctx)
 	if o.cancel != nil {
 		o.cancel()
 		o.cancel = nil
 	}
-	return closing
+	if o.Client != nil {
+		closing := o.OpcUAInputClient.Stop(ctx)
+		return closing
+	}
+	return nil
 }
 
 func (o *subscribeClient) startMonitoring(ctx context.Context) (<-chan telegraf.Metric, error) {

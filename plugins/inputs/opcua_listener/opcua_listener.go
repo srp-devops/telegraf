@@ -143,6 +143,11 @@ func (o *OpcUaListener) connect(acc telegraf.Accumulator) error {
 		o.goroutineCancel()
 	}
 
+	// Fully tear down the old OPC UA client (subscription, notification goroutine,
+	// gopcua connection) before starting fresh. This kills gopcua's background
+	// auto-reconnect goroutines and prevents them from racing with our reconnect.
+	o.client.stop(context.Background())
+
 	ctx := context.Background()
 	ch, err := o.client.startMonitoring(ctx)
 	if err != nil {
