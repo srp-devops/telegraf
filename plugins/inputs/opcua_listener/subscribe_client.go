@@ -13,7 +13,6 @@ import (
 	"github.com/gopcua/opcua/ua"
 	"github.com/influxdata/telegraf"
 	"github.com/influxdata/telegraf/config"
-	opcuaclient "github.com/influxdata/telegraf/plugins/common/opcua"
 	"github.com/influxdata/telegraf/plugins/common/opcua/input"
 )
 
@@ -278,9 +277,9 @@ func (o *subscribeClient) connect() error {
 
 func (o *subscribeClient) stop(ctx context.Context) <-chan struct{} {
 	o.Log.Debugf("Stopping OPC subscription...")
-	if o.State() != opcuaclient.Connected && o.State() != opcuaclient.Reconnecting {
-		return nil
-	}
+	// if o.State() != opcuaclient.Connected && o.State() != opcuaclient.Reconnecting {
+	// 	return nil
+	// }
 	if o.sub != nil {
 		if err := o.sub.Cancel(ctx); err != nil {
 			o.Log.Warn("Cancelling OPC UA subscription failed with error ", err)
@@ -295,7 +294,10 @@ func (o *subscribeClient) stop(ctx context.Context) <-chan struct{} {
 		closing := o.OpcUAInputClient.Stop(ctx)
 		return closing
 	}
-	return nil
+
+	ch := make(chan struct{})
+	close(ch)
+	return ch
 }
 
 func (o *subscribeClient) startMonitoring(ctx context.Context) (<-chan telegraf.Metric, error) {
