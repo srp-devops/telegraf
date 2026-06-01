@@ -18,4 +18,3 @@ FROM debian:bookworm-slim
 # Install ca-certificates in case telegraf makes HTTPS requests
 RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates && rm -rf /var/lib/apt/lists/*
 COPY --from=builder /src/telegraf /usr/bin/telegraf
-ENTRYPOINT ["telegraf"]
