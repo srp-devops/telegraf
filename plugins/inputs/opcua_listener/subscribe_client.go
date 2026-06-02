@@ -215,13 +215,17 @@ func (sc *subscribeClientConfig) createSubscribeClient(log telegraf.Logger) (*su
 }
 
 func (o *subscribeClient) connect() error {
-	err := o.OpcUAClient.Connect(o.ctx)
+	ctx := o.ctx
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	err := o.OpcUAClient.Connect(ctx)
 	if err != nil {
 		return err
 	}
 
 	// Fetch namespace array for namespace URI support
-	if err := o.OpcUAClient.UpdateNamespaceArray(o.ctx); err != nil {
+	if err := o.OpcUAClient.UpdateNamespaceArray(ctx); err != nil {
 		o.Log.Warnf("Failed to fetch namespace array: %v", err)
 	}
 
@@ -263,7 +267,7 @@ func (o *subscribeClient) connect() error {
 	}
 
 	o.Log.Debugf("Creating OPC UA subscription")
-	o.sub, err = o.Client.Subscribe(o.ctx, &opcua.SubscriptionParameters{
+	o.sub, err = o.Client.Subscribe(ctx, &opcua.SubscriptionParameters{
 		Interval: time.Duration(o.Config.SubscriptionInterval),
 	}, o.dataNotifications)
 	if err != nil {
@@ -339,36 +343,57 @@ func (o *subscribeClient) startMonitoring(ctx context.Context) (<-chan telegraf.
 	o.failedItemsReqs = nil
 	o.failedEventItemsReqs = nil
 
+	chunkSize := o.Config.MaxRetryChunkSize
+	if chunkSize <= 0 {
+		chunkSize = 500
+	}
+
 	if len(o.monitoredItemsReqs) != 0 {
-		resp, err := o.sub.Monitor(ctx, ua.TimestampsToReturnBoth, o.monitoredItemsReqs...)
-		if err != nil {
-			return nil, fmt.Errorf("failed to start monitoring items: %w", err)
-		}
-		o.Log.Debug("Monitoring items")
-		for idx, res := range resp.Results {
-			if !o.StatusCodeOK(res.StatusCode) {
-				if len(o.OpcUAInputClient.NodeIDs) > idx {
-					o.Log.Errorf("Failed to create monitored item for node %v (%v) with status code: %v",
-						o.OpcUAInputClient.NodeMetricMapping[idx].Tag.FieldName, o.OpcUAInputClient.NodeIDs[idx].String(), res.StatusCode)
-				} else {
-					o.Log.Errorf("Failed to create monitored item for node %v (%v) with status code: %v",
-						o.OpcUAInputClient.NodeMetricMapping[idx].Tag.FieldName, '?', res.StatusCode)
+		for i := 0; i < len(o.monitoredItemsReqs); i += chunkSize {
+			end := i + chunkSize
+			if end > len(o.monitoredItemsReqs) {
+				end = len(o.monitoredItemsReqs)
+			}
+			chunk := o.monitoredItemsReqs[i:end]
+			resp, err := o.sub.Monitor(ctx, ua.TimestampsToReturnBoth, chunk...)
+			if err != nil {
+				return nil, fmt.Errorf("failed to start monitoring items: %w", err)
+			}
+			o.Log.Debugf("Monitoring %d items (chunk starting at %d)", len(chunk), i)
+			for idx, res := range resp.Results {
+				globalIdx := i + idx
+				if !o.StatusCodeOK(res.StatusCode) {
+					if len(o.OpcUAInputClient.NodeIDs) > globalIdx {
+						o.Log.Errorf("Failed to create monitored item for node %v (%v) with status code: %v",
+							o.OpcUAInputClient.NodeMetricMapping[globalIdx].Tag.FieldName, o.OpcUAInputClient.NodeIDs[globalIdx].String(), res.StatusCode)
+					} else {
+						o.Log.Errorf("Failed to create monitored item for node %v (%v) with status code: %v",
+							o.OpcUAInputClient.NodeMetricMapping[globalIdx].Tag.FieldName, '?', res.StatusCode)
+					}
+					o.failedItemsReqs = append(o.failedItemsReqs, o.monitoredItemsReqs[globalIdx])
 				}
-				o.failedItemsReqs = append(o.failedItemsReqs, o.monitoredItemsReqs[idx])
 			}
 		}
 	}
 
 	if len(o.eventItemsReqs) != 0 {
-		resp, err := o.sub.Monitor(ctx, ua.TimestampsToReturnBoth, o.eventItemsReqs...)
-		if err != nil {
-			return nil, fmt.Errorf("failed to start monitoring event stream: %w", err)
-		}
-		o.Log.Debug("Monitoring events")
-		for idx, res := range resp.Results {
-			if !o.StatusCodeOK(res.StatusCode) {
-				o.Log.Errorf("creating monitored event streaming item failed with status code: %v", res.StatusCode)
-				o.failedEventItemsReqs = append(o.failedEventItemsReqs, o.eventItemsReqs[idx])
+		for i := 0; i < len(o.eventItemsReqs); i += chunkSize {
+			end := i + chunkSize
+			if end > len(o.eventItemsReqs) {
+				end = len(o.eventItemsReqs)
+			}
+			chunk := o.eventItemsReqs[i:end]
+			resp, err := o.sub.Monitor(ctx, ua.TimestampsToReturnBoth, chunk...)
+			if err != nil {
+				return nil, fmt.Errorf("failed to start monitoring event stream: %w", err)
+			}
+			o.Log.Debugf("Monitoring %d events (chunk starting at %d)", len(chunk), i)
+			for idx, res := range resp.Results {
+				globalIdx := i + idx
+				if !o.StatusCodeOK(res.StatusCode) {
+					o.Log.Errorf("creating monitored event streaming item failed with status code: %v", res.StatusCode)
+					o.failedEventItemsReqs = append(o.failedEventItemsReqs, o.eventItemsReqs[globalIdx])
+				}
 			}
 		}
 	}
@@ -410,7 +435,11 @@ func (o *subscribeClient) processReceivedNotifications() {
 			switch notif := res.Value.(type) {
 			case *ua.DataChangeNotification:
 				o.UpdateLastDataReceived()
-				o.Log.Debugf("Received data change notification with %d items", len(notif.MonitoredItems))
+				subID := uint32(0)
+				if o.sub != nil {
+					subID = o.sub.SubscriptionID
+				}
+				o.Log.Infof("Received data change notification on subscription %d with %d items", subID, len(notif.MonitoredItems))
 				for _, monitoredItemNotif := range notif.MonitoredItems {
 					i := int(monitoredItemNotif.ClientHandle)
 					oldValue := o.LastReceivedData[i].Value
@@ -424,8 +453,8 @@ func (o *subscribeClient) processReceivedNotifications() {
 					// triggering a full reconnect.
 					if !o.StatusCodeOK(monitoredItemNotif.Value.Status) {
 						errCode := monitoredItemNotif.Value.Status.Error()
-						if strings.Contains(errCode, "BadNodeIdUnknown") ||
-							strings.Contains(errCode, "BadNodeIdInvalid") ||
+						if strings.Contains(errCode, "BadNodeIDUnknown") ||
+							strings.Contains(errCode, "BadNodeIDInvalid") ||
 							strings.Contains(errCode, "BadNotReadable") ||
 							strings.Contains(errCode, "BadUserAccessDenied") ||
 							strings.Contains(errCode, "BadTypeMismatch") {
@@ -443,8 +472,8 @@ func (o *subscribeClient) processReceivedNotifications() {
 					fatalCount := 0
 					for _, d := range o.LastReceivedData {
 						errCode := d.Quality.Error()
-						if strings.Contains(errCode, "BadNodeIdUnknown") ||
-							strings.Contains(errCode, "BadNodeIdInvalid") ||
+						if strings.Contains(errCode, "BadNodeIDUnknown") ||
+							strings.Contains(errCode, "BadNodeIDInvalid") ||
 							strings.Contains(errCode, "BadNotReadable") ||
 							strings.Contains(errCode, "BadUserAccessDenied") ||
 							strings.Contains(errCode, "BadTypeMismatch") {
