@@ -80,6 +80,8 @@ type NodeGroupSettings struct {
 	Nodes            []NodeSettings    `toml:"nodes"`
 	DefaultTags      map[string]string `toml:"default_tags"`
 	SamplingInterval config.Duration   `toml:"sampling_interval"` // Can be overridden by monitoring parameters
+	QueueSize        *uint32           `toml:"queue_size"`        // Can be overridden by monitoring parameters
+	DiscardOldest    *bool             `toml:"discard_oldest"`    // Can be overridden by monitoring parameters
 }
 
 type EventNodeSettings struct {
@@ -476,6 +478,12 @@ func (o *OpcUAInputClient) InitNodeMetricMapping() error {
 			}
 			if node.MonitoringParams.SamplingInterval == 0 {
 				node.MonitoringParams.SamplingInterval = group.SamplingInterval
+			}
+			if node.MonitoringParams.QueueSize == nil && group.QueueSize != nil {
+				node.MonitoringParams.QueueSize = group.QueueSize
+			}
+			if node.MonitoringParams.DiscardOldest == nil && group.DiscardOldest != nil {
+				node.MonitoringParams.DiscardOldest = group.DiscardOldest
 			}
 
 			nmm, err := NewNodeMetricMapping(group.MetricName, node, group.DefaultTags)
