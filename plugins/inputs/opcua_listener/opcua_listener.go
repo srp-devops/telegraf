@@ -5,6 +5,7 @@ import (
 	"context"
 	_ "embed"
 	"fmt"
+	"math/rand/v2"
 	"time"
 
 	"github.com/influxdata/telegraf"
@@ -22,8 +23,19 @@ type OpcUaListener struct {
 	goroutineCtx    context.Context
 	goroutineCancel context.CancelFunc
 
-	nextReconnectTime time.Time
-	reconnectWait     time.Duration
+	nextReconnectTime             time.Time
+	reconnectWait                 time.Duration
+	consecutiveMaxBackoffFailures int
+}
+
+// reconnectSem serializes reconnect attempts across all opcua_listener instances
+// in this process. Only one plugin reconnects at a time; others skip and retry
+// on the next Gather() cycle. This prevents thundering herd when multiple
+// plugins detect a network glitch simultaneously.
+var reconnectSem = make(chan struct{}, 1)
+
+func init() {
+	reconnectSem <- struct{}{}
 }
 
 //go:embed sample.conf
@@ -93,6 +105,16 @@ func (o *OpcUaListener) connectWithBackoff(acc telegraf.Accumulator) error {
 		return nil
 	}
 
+	// Acquire reconnect semaphore (non-blocking). If another plugin instance
+	// is currently reconnecting, skip this attempt and retry next Gather().
+	select {
+	case <-reconnectSem:
+		defer func() { reconnectSem <- struct{}{} }()
+	default:
+		o.Log.Debugf("connectWithBackoff: another plugin is reconnecting, will retry next interval")
+		return nil
+	}
+
 	o.Log.Debugf("connectWithBackoff: attempting connection (state=%v)", o.client.State())
 	err := o.connect(acc)
 	if err != nil {
@@ -104,8 +126,35 @@ func (o *OpcUaListener) connectWithBackoff(acc telegraf.Accumulator) error {
 		if o.reconnectWait > 5*time.Minute {
 			o.reconnectWait = 5 * time.Minute
 		}
-		o.nextReconnectTime = time.Now().Add(o.reconnectWait)
-		o.Log.Errorf("connectWithBackoff: reconnect failed: %v. Backing off for %v (next attempt at %v)", err, o.reconnectWait, o.nextReconnectTime.Format(time.RFC3339))
+
+		if o.reconnectWait >= 5*time.Minute {
+			o.consecutiveMaxBackoffFailures++
+			if o.consecutiveMaxBackoffFailures >= 3 {
+				o.Log.Warnf("connectWithBackoff: %d consecutive failures at max backoff; performing full client reset", o.consecutiveMaxBackoffFailures)
+				o.consecutiveMaxBackoffFailures = 0
+
+				// Full teardown — recreate the subscribe client from scratch
+				if o.client != nil {
+					o.client.stop(context.Background())
+				}
+				newClient, createErr := o.subscribeClientConfig.createSubscribeClient(o.Log)
+				if createErr != nil {
+					o.Log.Errorf("connectWithBackoff: failed to recreate client during reset: %v", createErr)
+				} else {
+					o.client = newClient
+					// Start backoff from scratch (initial wait)
+					o.reconnectWait = 30 * time.Second
+				}
+			}
+		}
+
+		// Add ±20% jitter to prevent synchronized retries across instances
+		jitter := time.Duration(rand.Int64N(int64(o.reconnectWait) / 5))
+		if rand.IntN(2) == 0 {
+			jitter = -jitter
+		}
+		o.nextReconnectTime = time.Now().Add(o.reconnectWait + jitter)
+		o.Log.Errorf("connectWithBackoff: reconnect failed: %v. Backing off for %v (next attempt at %v)", err, o.reconnectWait+jitter, o.nextReconnectTime.Format(time.RFC3339))
 
 		if o.subscribeClientConfig.ConnectFailBehavior == "error" {
 			return err
@@ -116,6 +165,7 @@ func (o *OpcUaListener) connectWithBackoff(acc telegraf.Accumulator) error {
 	o.Log.Debugf("connectWithBackoff: connection successful, resetting backoff (state=%v)", o.client.State())
 	o.reconnectWait = 0
 	o.nextReconnectTime = time.Time{}
+	o.consecutiveMaxBackoffFailures = 0
 	return nil
 }
 
