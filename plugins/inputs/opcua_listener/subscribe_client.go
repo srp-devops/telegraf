@@ -91,10 +91,10 @@ func (o *subscribeClient) RetryMissingItems(ctx context.Context) {
 			end = chunkSize
 		}
 		retrying := o.failedItemsReqs[:end]
-		o.Log.Debugf("Retrying %d missing monitored items", len(retrying))
+		o.Log.Infof("Retrying %d missing monitored items", len(retrying))
 		resp, err := o.sub.Monitor(ctx, ua.TimestampsToReturnBoth, retrying...)
 		if err != nil {
-			o.Log.Debugf("Retry Monitor call failed: %v", err)
+			o.Log.Infof("Retry Monitor call failed: %v", err)
 		} else {
 			stillFailed := o.failedItemsReqs[end:]
 			var backToFailed []*ua.MonitoredItemCreateRequest
@@ -442,10 +442,11 @@ func (o *subscribeClient) processReceivedNotifications() {
 				o.Log.Infof("Received data change notification on subscription %d with %d items", subID, len(notif.MonitoredItems))
 				for _, monitoredItemNotif := range notif.MonitoredItems {
 					i := int(monitoredItemNotif.ClientHandle)
-					oldValue := o.LastReceivedData[i].Value
+					// removed debug data change notification for now
+					// oldValue := o.LastReceivedData[i].Value
 					o.UpdateNodeValue(i, monitoredItemNotif.Value)
-					o.Log.Debugf("Data change notification: node %q value changed from %v to %v",
-						o.NodeIDs[i].String(), oldValue, o.LastReceivedData[i].Value)
+					// o.Log.Debugf("Data change notification: node %q value changed from %v to %v",
+					// 	o.NodeIDs[i].String(), oldValue, o.LastReceivedData[i].Value)
 					o.metrics <- o.MetricForNode(i)
 
 					// Track individual nodes that return permanent fatal errors so
