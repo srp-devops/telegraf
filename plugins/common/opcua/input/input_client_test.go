@@ -468,6 +468,10 @@ func TestValidateNodeToAdd(t *testing.T) {
 }
 
 func TestInitNodeMetricMapping(t *testing.T) {
+	var (
+		groupQueueSize     uint32 = 25
+		groupDiscardOldest bool   = false
+	)
 	tests := []struct {
 		testname string
 		config   InputClientConfig
@@ -590,6 +594,50 @@ func TestInitNodeMetricMapping(t *testing.T) {
 						IdentifierType: "s",
 						Identifier:     "id2",
 						DefaultTags:    map[string]string{"t2": "v2"},
+					},
+					idStr:      "ns=3;s=id2",
+					metricName: "groupmetric",
+					MetricTags: map[string]string{"t2": "v2"},
+				},
+			},
+			err: nil,
+		},
+		{
+			testname: "group node inheriting sampling_interval, queue_size, discard_oldest",
+			config: InputClientConfig{
+				MetricName: "testmetric",
+				Timestamp:  TimestampSourceTelegraf,
+				Groups: []NodeGroupSettings{
+					{
+						MetricName:       "groupmetric",
+						Namespace:        "3",
+						IdentifierType:   "s",
+						SamplingInterval: config.Duration(5 * time.Second),
+						QueueSize:        &groupQueueSize,
+						DiscardOldest:    &groupDiscardOldest,
+						Nodes: []NodeSettings{
+							{
+								FieldName:   "f",
+								Identifier:  "id2",
+								DefaultTags: map[string]string{"t2": "v2"},
+							},
+						},
+					},
+				},
+			},
+			expected: []NodeMetricMapping{
+				{
+					Tag: NodeSettings{
+						FieldName:      "f",
+						Namespace:      "3",
+						IdentifierType: "s",
+						Identifier:     "id2",
+						DefaultTags:    map[string]string{"t2": "v2"},
+						MonitoringParams: MonitoringParameters{
+							SamplingInterval: config.Duration(5 * time.Second),
+							QueueSize:        &groupQueueSize,
+							DiscardOldest:    &groupDiscardOldest,
+						},
 					},
 					idStr:      "ns=3;s=id2",
 					metricName: "groupmetric",

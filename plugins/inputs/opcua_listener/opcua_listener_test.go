@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/docker/go-connections/nat"
+	gopcua "github.com/gopcua/opcua"
 	"github.com/gopcua/opcua/ua"
 	"github.com/stretchr/testify/require"
 	"github.com/testcontainers/testcontainers-go/wait"
@@ -95,7 +96,8 @@ func TestStartPlugin(t *testing.T) {
 	}
 	require.NoError(t, plugin.Init())
 	err := plugin.Start(acc)
-	require.ErrorContains(t, err, "could not resolve address")
+	require.Error(t, err)
+	require.True(t, strings.Contains(err.Error(), "could not resolve address") || strings.Contains(err.Error(), "no such host"))
 
 	plugin.subscribeClientConfig.ConnectFailBehavior = "ignore"
 	require.NoError(t, plugin.Init())
@@ -123,6 +125,7 @@ func TestStartPlugin(t *testing.T) {
 	newEndpoint := fmt.Sprintf("opc.tcp://%s:%s", container.Address, container.Ports[servicePort])
 	plugin.client.Config.Endpoint = newEndpoint
 	plugin.client.OpcUAClient.Config.Endpoint = newEndpoint
+	plugin.nextReconnectTime = time.Time{}
 	err = plugin.Gather(acc)
 	require.NoError(t, err)
 	require.Equal(t, opcua.Connected, plugin.client.OpcUAClient.State())
@@ -561,6 +564,64 @@ deadband_value = 100.0
 	}, o.subscribeClientConfig.Groups)
 }
 
+func TestSubscribeClientConfigWithGroupLevelMonitoringParams(t *testing.T) {
+	toml := `
+[[inputs.opcua_listener]]
+name = "localhost"
+endpoint = "opc.tcp://localhost:4840"
+subscription_interval = "200ms"
+
+[[inputs.opcua_listener.group]]
+name = "foo"
+namespace = "3"
+identifier_type = "i"
+queue_size = 15
+discard_oldest = false
+default_tags = {tag1="val1", tag2="val2"}
+nodes = [
+  { name = "name3", identifier = "3000" }
+]
+`
+
+	c := config.NewConfig()
+	err := c.LoadConfigData([]byte(toml), config.EmptySourcePath)
+	require.NoError(t, err)
+
+	require.Len(t, c.Inputs, 1)
+
+	o, ok := c.Inputs[0].Input.(*OpcUaListener)
+	require.True(t, ok)
+
+	queueSize := uint32(15)
+	discardOldest := false
+	require.Equal(t, []input.NodeGroupSettings{
+		{
+			MetricName:     "foo",
+			Namespace:      "3",
+			IdentifierType: "i",
+			QueueSize:      &queueSize,
+			DiscardOldest:  &discardOldest,
+			DefaultTags:    map[string]string{"tag1": "val1", "tag2": "val2"},
+			Nodes: []input.NodeSettings{{
+				FieldName:   "name3",
+				Identifier:  "3000",
+				DefaultTags: nil,
+				MonitoringParams: input.MonitoringParameters{
+					QueueSize:     nil,
+					DiscardOldest: nil,
+				},
+			}},
+		},
+	}, o.subscribeClientConfig.Groups)
+
+	o.Log = testutil.Logger{}
+	err = o.Init()
+	require.NoError(t, err)
+	require.Len(t, o.client.NodeMetricMapping, 1)
+	require.Equal(t, &queueSize, o.client.NodeMetricMapping[0].Tag.MonitoringParams.QueueSize)
+	require.Equal(t, &discardOldest, o.client.NodeMetricMapping[0].Tag.MonitoringParams.DiscardOldest)
+}
+
 func TestSubscribeClientConfigInvalidTrigger(t *testing.T) {
 	subscribeConfig := subscribeClientConfig{
 		InputClientConfig: input.InputClientConfig{
@@ -592,7 +653,7 @@ func TestSubscribeClientConfigInvalidTrigger(t *testing.T) {
 	})
 
 	_, err := subscribeConfig.createSubscribeClient(testutil.Logger{})
-	require.ErrorContains(t, err, "trigger 'not_valid' not supported, node 'ns=3;i=1'")
+	require.ErrorContains(t, err, "node 'ns=3;i=1': trigger 'not_valid' not supported")
 }
 
 func TestSubscribeClientConfigMissingTrigger(t *testing.T) {
@@ -626,7 +687,7 @@ func TestSubscribeClientConfigMissingTrigger(t *testing.T) {
 	})
 
 	_, err := subscribeConfig.createSubscribeClient(testutil.Logger{})
-	require.ErrorContains(t, err, "trigger '' not supported, node 'ns=3;i=1'")
+	require.ErrorContains(t, err, "node 'ns=3;i=1': trigger '' not supported")
 }
 
 func TestSubscribeClientConfigInvalidDeadbandType(t *testing.T) {
@@ -661,7 +722,7 @@ func TestSubscribeClientConfigInvalidDeadbandType(t *testing.T) {
 	})
 
 	_, err := subscribeConfig.createSubscribeClient(testutil.Logger{})
-	require.ErrorContains(t, err, "deadband_type 'not_valid' not supported, node 'ns=3;i=1'")
+	require.ErrorContains(t, err, "node 'ns=3;i=1': deadband_type 'not_valid' not supported")
 }
 
 func TestSubscribeClientConfigMissingDeadbandType(t *testing.T) {
@@ -695,7 +756,7 @@ func TestSubscribeClientConfigMissingDeadbandType(t *testing.T) {
 	})
 
 	_, err := subscribeConfig.createSubscribeClient(testutil.Logger{})
-	require.ErrorContains(t, err, "deadband_type '' not supported, node 'ns=3;i=1'")
+	require.ErrorContains(t, err, "node 'ns=3;i=1': deadband_type '' not supported")
 }
 
 func TestSubscribeClientConfigInvalidDeadbandValue(t *testing.T) {
@@ -732,7 +793,7 @@ func TestSubscribeClientConfigInvalidDeadbandValue(t *testing.T) {
 	})
 
 	_, err := subscribeConfig.createSubscribeClient(testutil.Logger{})
-	require.ErrorContains(t, err, "negative deadband_value not supported, node 'ns=3;i=1'")
+	require.ErrorContains(t, err, "node 'ns=3;i=1': negative deadband_value not supported")
 }
 
 func TestSubscribeClientConfigMissingDeadbandValue(t *testing.T) {
@@ -767,7 +828,22 @@ func TestSubscribeClientConfigMissingDeadbandValue(t *testing.T) {
 	})
 
 	_, err := subscribeConfig.createSubscribeClient(testutil.Logger{})
-	require.ErrorContains(t, err, "deadband_value was not set, node 'ns=3;i=1'")
+	require.ErrorContains(t, err, "node 'ns=3;i=1': deadband_value was not set")
+}
+
+func initMonitoredItemsForTest(subClient *subscribeClient) error {
+	if err := subClient.OpcUAInputClient.InitNodeIDs(); err != nil {
+		return err
+	}
+	subClient.monitoredItemsReqs = make([]*ua.MonitoredItemCreateRequest, 0, len(subClient.NodeIDs))
+	for i, nodeID := range subClient.NodeIDs {
+		req := gopcua.NewMonitoredItemCreateRequestWithDefaults(nodeID, ua.AttributeIDValue, uint32(i))
+		if err := assignConfigValuesToRequest(req, &subClient.NodeMetricMapping[i].Tag.MonitoringParams); err != nil {
+			return err
+		}
+		subClient.monitoredItemsReqs = append(subClient.monitoredItemsReqs, req)
+	}
+	return nil
 }
 
 func TestSubscribeClientConfigValidMonitoringParams(t *testing.T) {
@@ -811,6 +887,7 @@ func TestSubscribeClientConfigValidMonitoringParams(t *testing.T) {
 
 	subClient, err := subscribeConfig.createSubscribeClient(testutil.Logger{})
 	require.NoError(t, err)
+	require.NoError(t, initMonitoredItemsForTest(subClient))
 	require.Equal(t, &ua.MonitoringParameters{
 		SamplingInterval: 50,
 		QueueSize:        queueSize,
@@ -864,6 +941,7 @@ func TestSubscribeClientConfigValidMonitoringParamsNoDeadband(t *testing.T) {
 
 	subClient, err := subscribeConfig.createSubscribeClient(testutil.Logger{})
 	require.NoError(t, err)
+	require.NoError(t, initMonitoredItemsForTest(subClient))
 	require.Equal(t, &ua.MonitoringParameters{
 		SamplingInterval: 50,
 		QueueSize:        queueSize,
@@ -944,6 +1022,7 @@ func TestSubscribeClientConfigValidMonitoringAndEventParams(t *testing.T) {
 
 	subClient, err := subscribeConfig.createSubscribeClient(testutil.Logger{})
 	require.NoError(t, err)
+	require.NoError(t, initMonitoredItemsForTest(subClient))
 	require.Equal(t, &ua.MonitoringParameters{
 		SamplingInterval: 50,
 		QueueSize:        queueSize,
