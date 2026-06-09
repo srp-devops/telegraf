@@ -192,6 +192,10 @@ func (sc *subscribeClientConfig) createSubscribeClient(log telegraf.Logger) (*su
 		return nil, err
 	}
 
+	// Let the caller own reconnection. Without this, gopcua's monitor and the
+	// caller's reconnect cycle both create sessions, flooding the server.
+	client.DisableAutoReconnect = true
+
 	// Validate monitoring parameters at config time (no server connection needed)
 	for _, node := range client.NodeMetricMapping {
 		if node.Tag.MonitoringParams.DataChangeFilter != nil {
