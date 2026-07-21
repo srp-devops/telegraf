@@ -320,10 +320,9 @@ func (o *subscribeClient) startMonitoring(ctx context.Context) (<-chan telegraf.
 	}
 	o.ctx, o.cancel = context.WithCancel(context.Background())
 
-	// Reset staleness timer — it only starts counting after the first notification
-	// arrives on the new connection, so the watchdog won't fire during initial setup.
+	// Reset staleness timer to zero while we set up the connection and register
+	// monitored items. It will be seeded to time.Now() after setup completes.
 	atomic.StoreInt64(&o.lastDataReceived, 0)
-	o.Log.Debugf("startMonitoring: staleness timer reset to 0")
 
 	// Recreate channels on every (re)connect. gopcua closes the dataNotifications
 	// channel when the subscription is torn down, so reusing a closed channel would
@@ -404,6 +403,13 @@ func (o *subscribeClient) startMonitoring(ctx context.Context) (<-chan telegraf.
 
 	o.Log.Debugf("startMonitoring: launching processReceivedNotifications goroutine (monitoredItems=%d, failedItems=%d, eventItems=%d, failedEventItems=%d)",
 		len(o.monitoredItemsReqs), len(o.failedItemsReqs), len(o.eventItemsReqs), len(o.failedEventItemsReqs))
+
+	// Seed staleness timer now that all monitored items are registered.
+	// This gives the watchdog a baseline: if no DataChangeNotification arrives
+	// within the threshold after this point, the subscription is considered
+	// zombie and Gather() will force a reconnect.
+	atomic.StoreInt64(&o.lastDataReceived, time.Now().Unix())
+	o.Log.Debugf("startMonitoring: staleness timer seeded to now")
 	go o.processReceivedNotifications()
 
 	return o.metrics, nil
