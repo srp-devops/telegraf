@@ -49,9 +49,9 @@ type subscribeClient struct {
 
 	failedItemsReqs      []*ua.MonitoredItemCreateRequest
 	failedEventItemsReqs []*ua.MonitoredItemCreateRequest
-	failedMu             sync.Mutex         // protects failedItemsReqs, failedEventItemsReqs, failedNodeSet
-	failedNodeSet        map[int]struct{}   // node indices already queued for retry (dedup)
-	monitoredItemIDs     map[int]uint32     // node index → server-assigned MonitoredItemID
+	failedMu             sync.Mutex       // protects failedItemsReqs, failedEventItemsReqs, failedNodeSet
+	failedNodeSet        map[int]struct{} // node indices already queued for retry (dedup)
+	monitoredItemIDs     map[int]uint32   // node index → server-assigned MonitoredItemID
 }
 
 func (o *subscribeClient) SubDropped() bool {
@@ -77,98 +77,168 @@ func (o *subscribeClient) SecondsSinceLastData() int64 {
 	return time.Now().Unix() - last
 }
 
+// isFatalStatusCode returns true if the error string contains a permanent OPC UA
+// status code that indicates the node cannot recover without re-registration
+// (e.g. after a server restart or namespace change).
+func isFatalStatusCode(errCode string) bool {
+	return strings.Contains(errCode, "BadNodeIDUnknown") ||
+		strings.Contains(errCode, "BadNodeIDInvalid") ||
+		strings.Contains(errCode, "BadNotReadable") ||
+		strings.Contains(errCode, "BadUserAccessDenied") ||
+		strings.Contains(errCode, "BadTypeMismatch")
+}
+
+// enqueueFailedNode adds a node to the retry queue if it is not already queued.
+// Safe to call from any goroutine.
+func (o *subscribeClient) enqueueFailedNode(nodeIdx int) {
+	o.failedMu.Lock()
+	defer o.failedMu.Unlock()
+	if _, already := o.failedNodeSet[nodeIdx]; already {
+		return
+	}
+	o.Log.Warnf("Node %q returned fatal status; adding to retry queue", o.NodeIDs[nodeIdx].String())
+	o.failedItemsReqs = append(o.failedItemsReqs, o.monitoredItemsReqs[nodeIdx])
+	o.failedNodeSet[nodeIdx] = struct{}{}
+}
+
+// retryChunkSize returns the configured chunk size or a default of 500.
+func (o *subscribeClient) retryChunkSize() int {
+	if o.Config.MaxRetryChunkSize > 0 {
+		return o.Config.MaxRetryChunkSize
+	}
+	return 500
+}
+
+// registerMonitoredItemsChunked registers items with the OPC UA server in chunks.
+// For each result, onResult is called with the global index and the result.
+// Returns an error only if the Monitor RPC itself fails.
+func (o *subscribeClient) registerMonitoredItemsChunked(
+	ctx context.Context,
+	items []*ua.MonitoredItemCreateRequest,
+	label string,
+	onResult func(globalIdx int, res *ua.MonitoredItemCreateResult),
+) error {
+	chunkSize := o.retryChunkSize()
+	for i := 0; i < len(items); i += chunkSize {
+		end := i + chunkSize
+		if end > len(items) {
+			end = len(items)
+		}
+		chunk := items[i:end]
+		resp, err := o.sub.Monitor(ctx, ua.TimestampsToReturnBoth, chunk...)
+		if err != nil {
+			return fmt.Errorf("failed to start monitoring %s: %w", label, err)
+		}
+		o.Log.Debugf("Monitoring %d %s (chunk starting at %d)", len(chunk), label, i)
+		for idx, res := range resp.Results {
+			onResult(i+idx, res)
+		}
+	}
+	return nil
+}
+
 // RetryMissingItems attempts to re-register monitored items that previously failed.
 // Called from Gather() on each interval so failed items are recovered without a full reconnect.
 func (o *subscribeClient) RetryMissingItems(ctx context.Context) {
 	if o.sub == nil {
 		return
 	}
+	o.retryFailedDataItems(ctx)
+	o.retryFailedEventItems(ctx)
+}
 
-	chunkSize := o.Config.MaxRetryChunkSize
-	if chunkSize <= 0 {
-		chunkSize = 500
-	}
-
-	if len(o.failedItemsReqs) > 0 {
-		o.failedMu.Lock()
-		end := len(o.failedItemsReqs)
-		if end > chunkSize {
-			end = chunkSize
-		}
-		retrying := make([]*ua.MonitoredItemCreateRequest, end)
-		copy(retrying, o.failedItemsReqs[:end])
-
-		// Collect old server-side MonitoredItemIDs so we can cancel them
-		// before re-registering to avoid duplicate items on the server.
-		var oldIDs []uint32
-		for _, req := range retrying {
-			nodeIdx := int(req.RequestedParameters.ClientHandle)
-			if id, ok := o.monitoredItemIDs[nodeIdx]; ok {
-				oldIDs = append(oldIDs, id)
-				delete(o.monitoredItemIDs, nodeIdx)
-			}
-		}
+func (o *subscribeClient) retryFailedDataItems(ctx context.Context) {
+	o.failedMu.Lock()
+	if len(o.failedItemsReqs) == 0 {
 		o.failedMu.Unlock()
+		return
+	}
 
-		// Cancel old monitored items on the server first
-		if len(oldIDs) > 0 {
-			if _, err := o.sub.Unmonitor(ctx, oldIDs...); err != nil {
-				o.Log.Warnf("Failed to unmonitor %d old items before retry: %v", len(oldIDs), err)
-			}
+	chunkSize := o.retryChunkSize()
+	end := len(o.failedItemsReqs)
+	if end > chunkSize {
+		end = chunkSize
+	}
+	retrying := make([]*ua.MonitoredItemCreateRequest, end)
+	copy(retrying, o.failedItemsReqs[:end])
+
+	// Collect old server-side MonitoredItemIDs so we can cancel them
+	// before re-registering to avoid duplicate items on the server.
+	var oldIDs []uint32
+	for _, req := range retrying {
+		nodeIdx := int(req.RequestedParameters.ClientHandle)
+		if id, ok := o.monitoredItemIDs[nodeIdx]; ok {
+			oldIDs = append(oldIDs, id)
+			delete(o.monitoredItemIDs, nodeIdx)
 		}
+	}
+	o.failedMu.Unlock()
 
-		o.Log.Infof("Retrying %d missing monitored items", len(retrying))
-		resp, err := o.sub.Monitor(ctx, ua.TimestampsToReturnBoth, retrying...)
-		if err != nil {
-			o.Log.Infof("Retry Monitor call failed: %v", err)
-		} else {
-			o.failedMu.Lock()
-			stillFailed := o.failedItemsReqs[end:]
-			var backToFailed []*ua.MonitoredItemCreateRequest
-			for idx, res := range resp.Results {
-				nodeIdx := int(retrying[idx].RequestedParameters.ClientHandle)
-				if o.StatusCodeOK(res.StatusCode) {
-					o.Log.Infof("Successfully recovered monitored item: %v", retrying[idx].ItemToMonitor.NodeID.String())
-					o.monitoredItemIDs[nodeIdx] = res.MonitoredItemID
-					delete(o.failedNodeSet, nodeIdx)
-				} else {
-					backToFailed = append(backToFailed, retrying[idx])
-				}
-			}
-			o.failedItemsReqs = append(stillFailed, backToFailed...)
-			o.failedMu.Unlock()
+	if len(oldIDs) > 0 {
+		if _, err := o.sub.Unmonitor(ctx, oldIDs...); err != nil {
+			o.Log.Warnf("Failed to unmonitor %d old items before retry: %v", len(oldIDs), err)
 		}
 	}
 
-	if len(o.failedEventItemsReqs) > 0 {
-		o.failedMu.Lock()
-		end := len(o.failedEventItemsReqs)
-		if end > chunkSize {
-			end = chunkSize
+	o.Log.Infof("Retrying %d missing monitored items", len(retrying))
+	resp, err := o.sub.Monitor(ctx, ua.TimestampsToReturnBoth, retrying...)
+	if err != nil {
+		o.Log.Infof("Retry Monitor call failed: %v", err)
+		return
+	}
+
+	o.failedMu.Lock()
+	defer o.failedMu.Unlock()
+	stillFailed := o.failedItemsReqs[end:]
+	var backToFailed []*ua.MonitoredItemCreateRequest
+	for idx, res := range resp.Results {
+		nodeIdx := int(retrying[idx].RequestedParameters.ClientHandle)
+		if o.StatusCodeOK(res.StatusCode) {
+			o.Log.Infof("Successfully recovered monitored item: %v", retrying[idx].ItemToMonitor.NodeID.String())
+			o.monitoredItemIDs[nodeIdx] = res.MonitoredItemID
+			delete(o.failedNodeSet, nodeIdx)
+		} else {
+			backToFailed = append(backToFailed, retrying[idx])
 		}
-		retrying := make([]*ua.MonitoredItemCreateRequest, end)
-		copy(retrying, o.failedEventItemsReqs[:end])
+	}
+	o.failedItemsReqs = append(stillFailed, backToFailed...)
+}
+
+func (o *subscribeClient) retryFailedEventItems(ctx context.Context) {
+	o.failedMu.Lock()
+	if len(o.failedEventItemsReqs) == 0 {
 		o.failedMu.Unlock()
+		return
+	}
 
-		o.Log.Debugf("Retrying %d missing event streaming items", len(retrying))
-		resp, err := o.sub.Monitor(ctx, ua.TimestampsToReturnBoth, retrying...)
-		if err != nil {
-			o.Log.Debugf("Retry Monitor call failed for event items: %v", err)
+	chunkSize := o.retryChunkSize()
+	end := len(o.failedEventItemsReqs)
+	if end > chunkSize {
+		end = chunkSize
+	}
+	retrying := make([]*ua.MonitoredItemCreateRequest, end)
+	copy(retrying, o.failedEventItemsReqs[:end])
+	o.failedMu.Unlock()
+
+	o.Log.Debugf("Retrying %d missing event streaming items", len(retrying))
+	resp, err := o.sub.Monitor(ctx, ua.TimestampsToReturnBoth, retrying...)
+	if err != nil {
+		o.Log.Debugf("Retry Monitor call failed for event items: %v", err)
+		return
+	}
+
+	o.failedMu.Lock()
+	defer o.failedMu.Unlock()
+	stillFailed := o.failedEventItemsReqs[end:]
+	var backToFailed []*ua.MonitoredItemCreateRequest
+	for idx, res := range resp.Results {
+		if o.StatusCodeOK(res.StatusCode) {
+			o.Log.Infof("Successfully recovered monitored event streaming item")
 		} else {
-			o.failedMu.Lock()
-			stillFailed := o.failedEventItemsReqs[end:]
-			var backToFailed []*ua.MonitoredItemCreateRequest
-			for idx, res := range resp.Results {
-				if o.StatusCodeOK(res.StatusCode) {
-					o.Log.Infof("Successfully recovered monitored event streaming item")
-				} else {
-					backToFailed = append(backToFailed, retrying[idx])
-				}
-			}
-			o.failedEventItemsReqs = append(stillFailed, backToFailed...)
-			o.failedMu.Unlock()
+			backToFailed = append(backToFailed, retrying[idx])
 		}
 	}
+	o.failedEventItemsReqs = append(stillFailed, backToFailed...)
 }
 
 func checkDataChangeFilterParameters(params *input.DataChangeFilter) error {
@@ -336,8 +406,7 @@ func (o *subscribeClient) stop(ctx context.Context) <-chan struct{} {
 		o.cancel = nil
 	}
 	if o.Client != nil {
-		closing := o.OpcUAInputClient.Stop(ctx)
-		return closing
+		return o.OpcUAInputClient.Stop(ctx)
 	}
 
 	ch := make(chan struct{})
@@ -385,61 +454,36 @@ func (o *subscribeClient) startMonitoring(ctx context.Context) (<-chan telegraf.
 	o.failedNodeSet = make(map[int]struct{})
 	o.monitoredItemIDs = make(map[int]uint32, len(o.NodeIDs))
 
-	chunkSize := o.Config.MaxRetryChunkSize
-	if chunkSize <= 0 {
-		chunkSize = 500
-	}
-
 	if len(o.monitoredItemsReqs) != 0 {
-		for i := 0; i < len(o.monitoredItemsReqs); i += chunkSize {
-			end := i + chunkSize
-			if end > len(o.monitoredItemsReqs) {
-				end = len(o.monitoredItemsReqs)
-			}
-			chunk := o.monitoredItemsReqs[i:end]
-			resp, err := o.sub.Monitor(ctx, ua.TimestampsToReturnBoth, chunk...)
-			if err != nil {
-				return nil, fmt.Errorf("failed to start monitoring items: %w", err)
-			}
-			o.Log.Debugf("Monitoring %d items (chunk starting at %d)", len(chunk), i)
-			for idx, res := range resp.Results {
-				globalIdx := i + idx
-				if !o.StatusCodeOK(res.StatusCode) {
-					if len(o.OpcUAInputClient.NodeIDs) > globalIdx {
-						o.Log.Errorf("Failed to create monitored item for node %v (%v) with status code: %v",
-							o.OpcUAInputClient.NodeMetricMapping[globalIdx].Tag.FieldName, o.OpcUAInputClient.NodeIDs[globalIdx].String(), res.StatusCode)
-					} else {
-						o.Log.Errorf("Failed to create monitored item for node %v (%v) with status code: %v",
-							o.OpcUAInputClient.NodeMetricMapping[globalIdx].Tag.FieldName, '?', res.StatusCode)
-					}
-					o.failedItemsReqs = append(o.failedItemsReqs, o.monitoredItemsReqs[globalIdx])
-					o.failedNodeSet[globalIdx] = struct{}{}
-				} else {
-					o.monitoredItemIDs[globalIdx] = res.MonitoredItemID
+		err = o.registerMonitoredItemsChunked(ctx, o.monitoredItemsReqs, "items", func(globalIdx int, res *ua.MonitoredItemCreateResult) {
+			if !o.StatusCodeOK(res.StatusCode) {
+				nodeName := "?"
+				nodeID := "?"
+				if globalIdx < len(o.OpcUAInputClient.NodeIDs) {
+					nodeName = o.OpcUAInputClient.NodeMetricMapping[globalIdx].Tag.FieldName
+					nodeID = o.OpcUAInputClient.NodeIDs[globalIdx].String()
 				}
+				o.Log.Errorf("Failed to create monitored item for node %v (%v) with status code: %v", nodeName, nodeID, res.StatusCode)
+				o.failedItemsReqs = append(o.failedItemsReqs, o.monitoredItemsReqs[globalIdx])
+				o.failedNodeSet[globalIdx] = struct{}{}
+			} else {
+				o.monitoredItemIDs[globalIdx] = res.MonitoredItemID
 			}
+		})
+		if err != nil {
+			return nil, err
 		}
 	}
 
 	if len(o.eventItemsReqs) != 0 {
-		for i := 0; i < len(o.eventItemsReqs); i += chunkSize {
-			end := i + chunkSize
-			if end > len(o.eventItemsReqs) {
-				end = len(o.eventItemsReqs)
+		err = o.registerMonitoredItemsChunked(ctx, o.eventItemsReqs, "events", func(globalIdx int, res *ua.MonitoredItemCreateResult) {
+			if !o.StatusCodeOK(res.StatusCode) {
+				o.Log.Errorf("creating monitored event streaming item failed with status code: %v", res.StatusCode)
+				o.failedEventItemsReqs = append(o.failedEventItemsReqs, o.eventItemsReqs[globalIdx])
 			}
-			chunk := o.eventItemsReqs[i:end]
-			resp, err := o.sub.Monitor(ctx, ua.TimestampsToReturnBoth, chunk...)
-			if err != nil {
-				return nil, fmt.Errorf("failed to start monitoring event stream: %w", err)
-			}
-			o.Log.Debugf("Monitoring %d events (chunk starting at %d)", len(chunk), i)
-			for idx, res := range resp.Results {
-				globalIdx := i + idx
-				if !o.StatusCodeOK(res.StatusCode) {
-					o.Log.Errorf("creating monitored event streaming item failed with status code: %v", res.StatusCode)
-					o.failedEventItemsReqs = append(o.failedEventItemsReqs, o.eventItemsReqs[globalIdx])
-				}
-			}
+		})
+		if err != nil {
+			return nil, err
 		}
 	}
 
@@ -458,107 +502,82 @@ func (o *subscribeClient) startMonitoring(ctx context.Context) (<-chan telegraf.
 }
 
 func (o *subscribeClient) processReceivedNotifications() {
-	o.Log.Debugf("processReceivedNotifications: goroutine started, waiting for notifications on dataNotifications channel")
+	o.Log.Debugf("processReceivedNotifications: goroutine started")
 	for {
 		select {
 		case <-o.ctx.Done():
-			o.Log.Debugf("processReceivedNotifications: context cancelled, stopping (state=%v, subDropped=%v)", o.State(), o.SubDropped())
+			o.Log.Debugf("processReceivedNotifications: context cancelled (state=%v, subDropped=%v)", o.State(), o.SubDropped())
 			return
 
 		case res, ok := <-o.dataNotifications:
 			if !ok {
-				// gopcua closed the channel — the session is unrecoverable at this level.
-				// Signal Gather() to perform a full Telegraf-level reconnect.
-				o.Log.Debugf("processReceivedNotifications: dataNotifications channel closed (state=%v); marking subscription as dropped", o.State())
+				o.Log.Debugf("processReceivedNotifications: channel closed (state=%v); marking subscription as dropped", o.State())
 				atomic.StoreInt32(&o.subDropped, 1)
 				return
 			}
 			if res.Error != nil {
-				o.Log.Errorf("processReceivedNotifications: received error notification: %v (state=%v)", res.Error, o.State())
+				o.Log.Errorf("processReceivedNotifications: error: %v (state=%v)", res.Error, o.State())
 				continue
 			}
 			if res.Value == nil {
-				// gopcua sends nil-value notifications as internal bookkeeping during
-				// session reconnects. Safe to skip — the session is still live.
-				o.Log.Warnf("processReceivedNotifications: received nil notification value (state=%v), skipping", o.State())
+				o.Log.Warnf("processReceivedNotifications: nil notification value (state=%v), skipping", o.State())
 				continue
 			}
 
 			switch notif := res.Value.(type) {
 			case *ua.DataChangeNotification:
-				o.UpdateLastDataReceived()
-				subID := uint32(0)
-				if o.sub != nil {
-					subID = o.sub.SubscriptionID
-				}
-				o.Log.Infof("Received data change notification on subscription %d with %d items", subID, len(notif.MonitoredItems))
-				for _, monitoredItemNotif := range notif.MonitoredItems {
-					i := int(monitoredItemNotif.ClientHandle)
-					// removed debug data change notification for now
-					// oldValue := o.LastReceivedData[i].Value
-					o.UpdateNodeValue(i, monitoredItemNotif.Value)
-					// o.Log.Debugf("Data change notification: node %q value changed from %v to %v",
-					// 	o.NodeIDs[i].String(), oldValue, o.LastReceivedData[i].Value)
-					o.metrics <- o.MetricForNode(i)
-
-					// Track individual nodes that return permanent fatal errors so
-					// RetryMissingItems() can attempt to re-register them without
-					// triggering a full reconnect. Guarded by failedMu and
-					// failedNodeSet to prevent duplicate entries.
-					if !o.StatusCodeOK(monitoredItemNotif.Value.Status) {
-						errCode := monitoredItemNotif.Value.Status.Error()
-						if strings.Contains(errCode, "BadNodeIDUnknown") ||
-							strings.Contains(errCode, "BadNodeIDInvalid") ||
-							strings.Contains(errCode, "BadNotReadable") ||
-							strings.Contains(errCode, "BadUserAccessDenied") ||
-							strings.Contains(errCode, "BadTypeMismatch") {
-							o.failedMu.Lock()
-							if _, already := o.failedNodeSet[i]; !already {
-								o.Log.Warnf("Node %q returned fatal status %q; adding to retry queue", o.NodeIDs[i].String(), errCode)
-								o.failedItemsReqs = append(o.failedItemsReqs, o.monitoredItemsReqs[i])
-								o.failedNodeSet[i] = struct{}{}
-							}
-							o.failedMu.Unlock()
-						}
-					}
-				}
-
-				// If ALL configured nodes went bad, check whether they carry fatal error codes
-				// (e.g. the server restarted and the namespace changed). A full reconnect is far
-				// faster than background chunk-retries in that situation. Transient errors like
-				// BadNoCommunication are deliberately excluded so the OPC session can ride them out.
-				if len(o.NodeIDs) > 0 && o.BadNodeCount >= len(o.NodeIDs) {
-					fatalCount := 0
-					for _, d := range o.LastReceivedData {
-						errCode := d.Quality.Error()
-						if strings.Contains(errCode, "BadNodeIDUnknown") ||
-							strings.Contains(errCode, "BadNodeIDInvalid") ||
-							strings.Contains(errCode, "BadNotReadable") ||
-							strings.Contains(errCode, "BadUserAccessDenied") ||
-							strings.Contains(errCode, "BadTypeMismatch") {
-							fatalCount++
-						}
-					}
-					if fatalCount >= len(o.NodeIDs) {
-						o.Log.Warnf("All %d nodes returned fatal errors. Triggering a fast full reconnect to restore subscriptions.", fatalCount)
-						atomic.StoreInt32(&o.subDropped, 1)
-						return // stop processing so Gather() handles the reconnect
-					}
-				}
-
+				o.handleDataChangeNotification(notif)
 			case *ua.EventNotificationList:
-				o.UpdateLastDataReceived()
-				o.Log.Debugf("Processing event notification with %d events", len(notif.Events))
-				for _, event := range notif.Events {
-					i := int(event.ClientHandle)
-					if m := o.MetricForEvent(i, event); m != nil {
-						o.metrics <- m
-					}
-				}
-
+				o.handleEventNotification(notif)
 			default:
 				o.Log.Warnf("Received notification has unexpected type %s", reflect.TypeOf(res.Value))
 			}
+		}
+	}
+}
+
+func (o *subscribeClient) handleDataChangeNotification(notif *ua.DataChangeNotification) {
+	o.UpdateLastDataReceived()
+	subID := uint32(0)
+	if o.sub != nil {
+		subID = o.sub.SubscriptionID
+	}
+	o.Log.Infof("Received data change notification on subscription %d with %d items", subID, len(notif.MonitoredItems))
+
+	for _, item := range notif.MonitoredItems {
+		i := int(item.ClientHandle)
+		o.UpdateNodeValue(i, item.Value)
+		o.metrics <- o.MetricForNode(i)
+
+		// Queue nodes with permanent fatal errors for retry via RetryMissingItems().
+		if !o.StatusCodeOK(item.Value.Status) && isFatalStatusCode(item.Value.Status.Error()) {
+			o.enqueueFailedNode(i)
+		}
+	}
+
+	// If ALL configured nodes carry fatal errors (e.g. server restarted with a
+	// different namespace), trigger a full reconnect instead of slow chunk-retries.
+	if len(o.NodeIDs) > 0 && o.BadNodeCount >= len(o.NodeIDs) {
+		fatalCount := 0
+		for _, d := range o.LastReceivedData {
+			if isFatalStatusCode(d.Quality.Error()) {
+				fatalCount++
+			}
+		}
+		if fatalCount >= len(o.NodeIDs) {
+			o.Log.Warnf("All %d nodes returned fatal errors. Triggering a fast full reconnect.", fatalCount)
+			atomic.StoreInt32(&o.subDropped, 1)
+		}
+	}
+}
+
+func (o *subscribeClient) handleEventNotification(notif *ua.EventNotificationList) {
+	o.UpdateLastDataReceived()
+	o.Log.Debugf("Processing event notification with %d events", len(notif.Events))
+	for _, event := range notif.Events {
+		i := int(event.ClientHandle)
+		if m := o.MetricForEvent(i, event); m != nil {
+			o.metrics <- m
 		}
 	}
 }
