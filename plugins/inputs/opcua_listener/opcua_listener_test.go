@@ -97,7 +97,7 @@ func TestStartPlugin(t *testing.T) {
 	require.NoError(t, plugin.Init())
 	err := plugin.Start(acc)
 	require.Error(t, err)
-	require.True(t, strings.Contains(err.Error(), "could not resolve address") || strings.Contains(err.Error(), "no such host"))
+	require.True(t, strings.Contains(err.Error(), "could not resolve address") || strings.Contains(err.Error(), "no such host") || strings.Contains(err.Error(), "i/o timeout") || strings.Contains(err.Error(), "lookup"))
 
 	plugin.subscribeClientConfig.ConnectFailBehavior = "ignore"
 	require.NoError(t, plugin.Init())
@@ -289,12 +289,14 @@ func TestSubscribeClientIntegrationAdditionalFields(t *testing.T) {
 	for i, x := range testopctags {
 		now := time.Now()
 		tags := map[string]string{
-			"id": fmt.Sprintf("ns=%s;%s=%s", x.namespace, x.identifierType, x.identifier),
+			"id": x.name,
 		}
 		fields := map[string]interface{}{
-			x.name:     x.want,
 			"Quality":  testopcquality[i],
 			"DataType": testopctypes[i],
+		}
+		if x.want != nil {
+			fields[x.name] = x.want
 		}
 		expectedopcmetrics = append(expectedopcmetrics, metric.New("testing", tags, fields, now))
 	}

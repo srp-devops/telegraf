@@ -194,12 +194,14 @@ func TestReadClientIntegrationAdditionalFields(t *testing.T) {
 	for i, x := range testopctags {
 		now := time.Now()
 		tags := map[string]string{
-			"id": fmt.Sprintf("ns=%s;%s=%s", x.namespace, x.identifierType, x.identifier),
+			"id": x.name,
 		}
 		fields := map[string]interface{}{
-			x.name:     x.want,
 			"Quality":  testopcquality[i],
 			"DataType": testopctypes[i],
+		}
+		if x.want != nil {
+			fields[x.name] = x.want
 		}
 		expectedopcmetrics = append(expectedopcmetrics, metric.New("testing", tags, fields, now))
 	}

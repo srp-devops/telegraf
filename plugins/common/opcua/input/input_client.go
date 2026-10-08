@@ -606,7 +606,7 @@ func (o *OpcUAInputClient) UpdateNodeValue(nodeIdx int, d *ua.DataValue) {
 func (o *OpcUAInputClient) MetricForNode(nodeIdx int) telegraf.Metric {
 	nmm := &o.NodeMetricMapping[nodeIdx]
 	tags := map[string]string{
-		"id": nmm.idStr,
+		"id": nmm.Tag.FieldName,
 	}
 	for k, v := range nmm.MetricTags {
 		tags[k] = v
