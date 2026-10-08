@@ -1,4 +1,7 @@
-FROM golang:1.25 AS builder
+FROM --platform=$BUILDPLATFORM golang:1.25 AS builder
+
+ARG TARGETOS
+ARG TARGETARCH
 
 WORKDIR /src
 
@@ -12,7 +15,7 @@ COPY . .
 # Use buildx cache mounts to drastically speed up repeated Go builds
 RUN --mount=type=cache,target=/root/.cache/go-build \
     --mount=type=cache,target=/go/pkg/mod \
-    make
+    GOOS=${TARGETOS} GOARCH=${TARGETARCH} make telegraf
 
 FROM debian:bookworm-slim
 # Install ca-certificates in case telegraf makes HTTPS requests
